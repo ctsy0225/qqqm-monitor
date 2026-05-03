@@ -173,7 +173,8 @@ jobs:
           diff = subprocess.run(['git', 'diff', '--cached', '--quiet'])
           if diff.returncode != 0:
               subprocess.run(['git', 'commit', '-m', 'XAUUSD ' + date_str], check=True)
-              subprocess.run(['git', 'push'], check=True)
+              subprocess.run(['git', 'pull', '--rebase', 'origin', 'main'], check=True)
+          subprocess.run(['git', 'push'], check=True)
 
           # 8. Telegram
           tg = os.environ.get('TELEGRAM_TOKEN', '')
