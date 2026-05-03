@@ -1,0 +1,104 @@
+name: QQQM Monthly Report
+
+on:
+  schedule:
+    - cron: '0 20 1 * *'
+  workflow_dispatch:
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - name: Generate and send QQQM report
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          python3 <<'PYEOF'
+          import urllib.request, json, os
+          from datetime import datetime, timezone, timedelta
+
+          beijing_tz = timezone(timedelta(hours=8))
+          now        = datetime.now(beijing_tz)
+          date_str   = now.strftime('%Y年%m月%d日')
+
+          # 1. Fetch QQQM (latest close = closes[-1])
+          req = urllib.request.Request(
+              'https://query1.finance.yahoo.com/v8/finance/chart/QQQM?interval=1d&range=30d',
+              headers={'User-Agent': 'Mozilla/5.0'})
+          with urllib.request.urlopen(req, timeout=15) as r:
+              d = json.loads(r.read())
+          closes = [c for c in d['chart']['result'][0]['indicators']['quote'][0]['close'] if c is not None]
+          current        = round(closes[-1], 2)
+          monthly_change = (current - closes[0])  / closes[0]  * 100
+          weekly_change  = (current - closes[-5]) / closes[-5] * 100 if len(closes) >= 5 else 0
+          ma20           = sum(closes[-20:]) / min(len(closes), 20)
+          vs_ma20        = (current - ma20) / ma20 * 100
+          print('QQQM:', current, 'monthly:', round(monthly_change, 2), 'date:', date_str)
+
+          # 2. Signal
+          if monthly_change < -5:
+              signal = '分批投入'
+          elif monthly_change < -2 and vs_ma20 < -3:
+              signal = '少投观望'
+          elif monthly_change > 8:
+              signal = '正常执行'
+          else:
+              signal = '直接投满'
+
+          # 3. DeepSeek commentary
+          commentary = ''
+          ds_key = os.environ.get('DEEPSEEK_API_KEY', '')
+          if ds_key:
+              try:
+                  prompt = ('QQQM ETF: price=' + str(current) +
+                      ', monthly=' + '{:+.1f}'.format(monthly_change) + '%' +
+                      ', weekly='  + '{:+.1f}'.format(weekly_change)  + '%' +
+                      ', vs_MA20=' + '{:+.1f}'.format(vs_ma20) + '%' +
+                      ', signal='  + signal +
+                      '\nWrite ONE sentence in Chinese (under 55 chars) explaining market context for this signal.')
+                  ds_data = json.dumps({'model': 'deepseek-chat',
+                      'messages': [{'role': 'user', 'content': prompt}],
+                      'max_tokens': 120}).encode()
+                  ds_req = urllib.request.Request('https://api.deepseek.com/v1/chat/completions',
+                      data=ds_data,
+                      headers={'Authorization': 'Bearer ' + ds_key, 'Content-Type': 'application/json'})
+                  with urllib.request.urlopen(ds_req, timeout=30) as r:
+                      commentary = json.loads(r.read())['choices'][0]['message']['content'].strip()
+                  print('DeepSeek OK')
+              except Exception as e:
+                  print('DeepSeek failed:', e)
+
+          # 4. Telegram
+          tg = os.environ.get('TELEGRAM_TOKEN', '')
+          if not tg:
+              raise Exception('TELEGRAM_TOKEN not set')
+
+          lines = [
+              '📊 QQQM ' + str(now.year) + '年' + str(now.month) + '月 定投摘要',
+              '',
+              '💰 当前价格：$' + '{:.2f}'.format(current),
+              '📈 本月涨跌：' + '{:+.1f}'.format(monthly_change) + '%',
+              '📅 本周涨跌：' + '{:+.1f}'.format(weekly_change)  + '%',
+              '📊 vs MA20：'                   + '{:+.1f}'.format(vs_ma20)        + '%',
+              '',
+              '🎯 本月建议：' + signal,
+          ]
+          if commentary:
+              lines += ['', '🤖 ' + commentary]
+          lines += [
+              '',
+              '🔗 https://ctsy0225.github.io/qqqm-monitor/',
+              '⏰ ' + date_str,
+          ]
+          msg  = '\n'.join(lines)
+          data = json.dumps({'chat_id': '6454973171', 'text': msg}).encode()
+          tg_req = urllib.request.Request(
+              'https://api.telegram.org/bot' + tg + '/sendMessage',
+              data=data, headers={'Content-Type': 'application/json'})
+          with urllib.request.urlopen(tg_req) as resp:
+              print('Telegram:', json.loads(resp.read()).get('ok'))
+          print('DONE.')
+          PYEOF
