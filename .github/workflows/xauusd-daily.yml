@@ -60,7 +60,7 @@ jobs:
           s1 = round(gold - 20, 1)
           s2 = round(gold - 45, 1)
           bias_cn    = '做多' if dxy_dir == 'falling' else ('做空' if dxy_dir == 'rising' else '中性')
-          bias_color = '#00c853'  if dxy_dir == 'falling' else '#ff1744'
+          bias_color = '#00c853' if dxy_dir == 'falling' else '#ff1744'
           dxy_cn     = '下行' if dxy_dir == 'falling' else '上行'
 
           # 4. DeepSeek
@@ -71,24 +71,29 @@ jobs:
                   prompt = ('Gold data: XAU/USD=' + str(gold) + ', DXY=' + str(dxy) +
                       '(' + dxy_dir + '), R2=' + str(r2) + ' R1=' + str(r1) +
                       ' S1=' + str(s1) + ' S2=' + str(s2) +
-                      '\nGenerate concise Chinese gold analysis. Respond ONLY with JSON (no markdown):' +
-                      '\n{"fundamental":["pt1","pt2","pt3","pt4"],"technical":["pt1","pt2"],"strategy":"one line"}' +
-                      '\nEach point under 28 Chinese chars. Strategy under 35 chars.')
+                      '\nGenerate concise Chinese gold analysis. Respond ONLY with valid JSON (no markdown):\n' +
+                      '{"fundamental":["pt1","pt2","pt3","pt4"],"technical":["pt1","pt2"],"strategy":"one line"}\n' +
+                      'Each point under 28 Chinese chars. Strategy under 35 chars.')
                   ds_data = json.dumps({'model': 'deepseek-chat',
                       'messages': [{'role': 'user', 'content': prompt}],
-                      'max_tokens': 350}).encode()
+                      'max_tokens': 400}).encode()
                   ds_req = urllib.request.Request('https://api.deepseek.com/v1/chat/completions',
                       data=ds_data,
                       headers={'Authorization': 'Bearer ' + ds_key, 'Content-Type': 'application/json'})
                   with urllib.request.urlopen(ds_req, timeout=30) as r:
                       ds_res = json.loads(r.read())
-                  ana   = json.loads(ds_res['choices'][0]['message']['content'])
+                  raw = ds_res['choices'][0]['message']['content'].strip()
+                  if raw.startswith('```'):
+                      raw = raw.split('```')[1]
+                      if raw.startswith('json'):
+                          raw = raw[4:]
+                  ana   = json.loads(raw)
                   fund  = ana.get('fundamental', [])
                   tech  = ana.get('technical',   [])
                   strat = ana.get('strategy',    '')
                   print('DeepSeek OK')
               except Exception as e:
-                  print('DeepSeek failed, using fallback:', e)
+                  print('DeepSeek failed:', e)
 
           if not fund:
               if dxy_dir == 'falling':
@@ -108,11 +113,11 @@ jobs:
                            '关键支撑 ' + str(s1) + '，跌破可看 ' + str(s2)]
                   strat = '空头思路，反弹 ' + str(r1) + ' 附近关注卖出'
 
-          # 5. HTML
-          li  = lambda xs: ''.join('<li>' + x + '</li>' for x in xs)
-          html = ('<!DOCTYPE html><html lang="zh"><head>'
-              '<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">'
-              '<title>XAU/USD</title><style>'
+          # 5. HTML — arrow is inline span, no CSS escape needed
+          arr = '<span class="arr">&#9654;</span>'
+          li  = lambda xs: ''.join('<li>' + arr + '<span>' + x + '</span></li>' for x in xs)
+
+          style = (
               '*{box-sizing:border-box;margin:0;padding:0}'
               'body{background:#0f0f0f;color:#e0e0e0;font-family:-apple-system,sans-serif;display:flex;justify-content:center;padding:16px}'
               '.card{width:100%;max-width:460px}'
@@ -124,14 +129,14 @@ jobs:
               '.sub{font-size:14px;color:#888;margin-top:6px}'
               '.bbox{background:#1a1a1a;border-radius:12px;padding:20px;text-align:center;margin-bottom:12px}'
               '.blbl{color:#888;font-size:13px;margin-bottom:8px}'
-              '.bias{font-size:38px;font-weight:800;color:' + bias_color + '}'
+              '.bias{font-size:38px;font-weight:800}'
               '.conf{display:inline-block;margin-top:8px;padding:4px 14px;background:#2a2a2a;border-radius:20px;font-size:13px;color:#aaa}'
               '.sec{background:#1a1a1a;border-radius:12px;padding:16px;margin-bottom:12px}'
               '.stitle{color:#FFD700;font-size:14px;font-weight:600;margin-bottom:10px;border-bottom:1px solid #2a2a2a;padding-bottom:8px}'
               'ul{list-style:none}'
-              'li{padding:7px 0;border-bottom:1px solid #1e1e1e;font-size:14px;color:#ccc}'
+              'li{padding:7px 0;border-bottom:1px solid #1e1e1e;font-size:14px;color:#ccc;display:flex;align-items:flex-start;gap:8px}'
               'li:last-child{border-bottom:none}'
-              'li::before{content:"\25B6";color:#FFD700;margin-right:8px;font-size:11px}'
+              '.arr{color:#FFD700;font-size:11px;flex-shrink:0;padding-top:2px}'
               '.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}'
               '.lv{background:#0f0f0f;border-radius:8px;padding:12px;text-align:center}'
               '.ll{font-size:12px;color:#888;margin-bottom:4px}'
@@ -139,12 +144,16 @@ jobs:
               '.ls{font-size:18px;font-weight:700;color:#51cf66}'
               '.strat{background:#1a1a1a;border:1px solid #FFD700;border-radius:12px;padding:16px;margin-bottom:12px;text-align:center;color:#FFD700;font-size:15px;font-weight:500}'
               '.footer{text-align:center;color:#444;font-size:12px;padding:8px}'
-              '</style></head><body><div class="card">'
+          )
+
+          html = ('<!DOCTYPE html><html lang="zh"><head>'
+              '<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">'
+              '<title>XAU/USD</title><style>' + style + '</style></head><body><div class="card">'
               '<div class="header"><h1>XAU/USD</h1><div class="dt">' + date_str + '</div></div>'
               '<div class="pbox"><div class="price">$' + '{:,.2f}'.format(gold) + '</div>'
               '<div class="sub">DXY ' + str(dxy) + ' &bull; ' + dxy_cn + '</div></div>'
               '<div class="bbox"><div class="blbl">每日偏见</div>'
-              '<div class="bias">' + bias_cn + '</div>'
+              '<div class="bias" style="color:' + bias_color + '">' + bias_cn + '</div>'
               '<div class="conf">置信度：中</div></div>'
               '<div class="sec"><div class="stitle">基本面 (4)</div><ul>' + li(fund) + '</ul></div>'
               '<div class="sec"><div class="stitle">技术面 (2)</div><ul>' + li(tech) + '</ul></div>'
@@ -169,12 +178,12 @@ jobs:
           # 7. Git push
           subprocess.run(['git', 'config', 'user.email', 'action@github.com'], check=True)
           subprocess.run(['git', 'config', 'user.name',  'GitHub Actions'],    check=True)
-          subprocess.run(['git', 'add', fname, 'XAUUSD/latest.html'],          check=True)
+          subprocess.run(['git', 'pull',   '--rebase', 'origin', 'main'],       check=True)
+          subprocess.run(['git', 'add', fname, 'XAUUSD/latest.html'],           check=True)
           diff = subprocess.run(['git', 'diff', '--cached', '--quiet'])
           if diff.returncode != 0:
               subprocess.run(['git', 'commit', '-m', 'XAUUSD ' + date_str], check=True)
-              subprocess.run(['git', 'pull', '--rebase', 'origin', 'main'], check=True)
-          subprocess.run(['git', 'push'], check=True)
+              subprocess.run(['git', 'push'], check=True)
 
           # 8. Telegram
           tg = os.environ.get('TELEGRAM_TOKEN', '')
