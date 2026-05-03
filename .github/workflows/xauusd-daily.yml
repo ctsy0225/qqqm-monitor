@@ -1,0 +1,190 @@
+name: XAUUSD Daily Report
+
+on:
+  schedule:
+    - cron: '0 21 * * 0-4'
+  workflow_dispatch:
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate and push report
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          python3 <<'PYEOF'
+          import urllib.request, json, os, subprocess
+          from datetime import datetime, timezone, timedelta
+
+          beijing_tz = timezone(timedelta(hours=8))
+          today    = datetime.now(beijing_tz).date()
+          date_str = str(today.day) + '-' + str(today.month) + '-' + str(today.year)
+
+          # 1. Gold price
+          req = urllib.request.Request(
+              'https://query1.finance.yahoo.com/v8/finance/chart/GC%3DF?interval=1d&range=2d',
+              headers={'User-Agent': 'Mozilla/5.0'})
+          with urllib.request.urlopen(req, timeout=15) as r:
+              d = json.loads(r.read())
+          prices = [p for p in d['chart']['result'][0]['indicators']['quote'][0]['close'] if p]
+          gold = round(prices[-1], 2)
+          print('GOLD:', gold)
+          if gold < 3000:
+              raise Exception('Invalid gold price: ' + str(gold))
+
+          # 2. DXY
+          try:
+              req2 = urllib.request.Request(
+                  'https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB?interval=1d&range=5d',
+                  headers={'User-Agent': 'Mozilla/5.0'})
+              with urllib.request.urlopen(req2, timeout=15) as r:
+                  d2 = json.loads(r.read())
+              dxy_list = [p for p in d2['chart']['result'][0]['indicators']['quote'][0]['close'] if p]
+              dxy     = round(dxy_list[-1], 2)
+              dxy_dir = 'falling' if dxy < round(dxy_list[-2], 2) else 'rising'
+          except Exception as e:
+              dxy, dxy_dir = 99.0, 'unknown'
+              print('DXY fallback:', e)
+
+          # 3. Levels
+          r2 = round(gold + 45, 1)
+          r1 = round(gold + 20, 1)
+          s1 = round(gold - 20, 1)
+          s2 = round(gold - 45, 1)
+          bias_cn    = '做多' if dxy_dir == 'falling' else ('做空' if dxy_dir == 'rising' else '中性')
+          bias_color = '#00c853'  if dxy_dir == 'falling' else '#ff1744'
+          dxy_cn     = '下行' if dxy_dir == 'falling' else '上行'
+
+          # 4. DeepSeek
+          fund, tech, strat = [], [], ''
+          ds_key = os.environ.get('DEEPSEEK_API_KEY', '')
+          if ds_key:
+              try:
+                  prompt = ('Gold data: XAU/USD=' + str(gold) + ', DXY=' + str(dxy) +
+                      '(' + dxy_dir + '), R2=' + str(r2) + ' R1=' + str(r1) +
+                      ' S1=' + str(s1) + ' S2=' + str(s2) +
+                      '\nGenerate concise Chinese gold analysis. Respond ONLY with JSON (no markdown):' +
+                      '\n{"fundamental":["pt1","pt2","pt3","pt4"],"technical":["pt1","pt2"],"strategy":"one line"}' +
+                      '\nEach point under 28 Chinese chars. Strategy under 35 chars.')
+                  ds_data = json.dumps({'model': 'deepseek-chat',
+                      'messages': [{'role': 'user', 'content': prompt}],
+                      'max_tokens': 350}).encode()
+                  ds_req = urllib.request.Request('https://api.deepseek.com/v1/chat/completions',
+                      data=ds_data,
+                      headers={'Authorization': 'Bearer ' + ds_key, 'Content-Type': 'application/json'})
+                  with urllib.request.urlopen(ds_req, timeout=30) as r:
+                      ds_res = json.loads(r.read())
+                  ana   = json.loads(ds_res['choices'][0]['message']['content'])
+                  fund  = ana.get('fundamental', [])
+                  tech  = ana.get('technical',   [])
+                  strat = ana.get('strategy',    '')
+                  print('DeepSeek OK')
+              except Exception as e:
+                  print('DeepSeek failed, using fallback:', e)
+
+          if not fund:
+              if dxy_dir == 'falling':
+                  fund  = ['美元指数 DXY ' + str(dxy) + ' 下行，利好黄金',
+                           '避险需求支撑黄金价格',
+                           '地缘政治不确定性提升吸引力',
+                           '实际利率低位对黄金构成支撑']
+                  tech  = ['短线上升趋势，支撑 ' + str(s1) + ' 有效',
+                           '关键阻力 ' + str(r1) + '，突破可看 ' + str(r2)]
+                  strat = '多头思路，回调 ' + str(s1) + ' 附近关注买入'
+              else:
+                  fund  = ['美元指数 DXY ' + str(dxy) + ' 上行，利空黄金',
+                           '实际利率上升压制黄金需求',
+                           '市场风险偏好改善，避险吸引力减弱',
+                           '技术面短线承压']
+                  tech  = ['短线承压，阻力 ' + str(r1) + ' 强',
+                           '关键支撑 ' + str(s1) + '，跌破可看 ' + str(s2)]
+                  strat = '空头思路，反弹 ' + str(r1) + ' 附近关注卖出'
+
+          # 5. HTML
+          li  = lambda xs: ''.join('<li>' + x + '</li>' for x in xs)
+          html = ('<!DOCTYPE html><html lang="zh"><head>'
+              '<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">'
+              '<title>XAU/USD</title><style>'
+              '*{box-sizing:border-box;margin:0;padding:0}'
+              'body{background:#0f0f0f;color:#e0e0e0;font-family:-apple-system,sans-serif;display:flex;justify-content:center;padding:16px}'
+              '.card{width:100%;max-width:460px}'
+              '.header{background:#1a1a1a;border:1px solid #FFD700;border-radius:12px;padding:20px;text-align:center;margin-bottom:12px}'
+              '.header h1{color:#FFD700;font-size:22px;font-weight:700}'
+              '.dt{color:#888;font-size:13px;margin-top:4px}'
+              '.pbox{background:#1a1a1a;border-radius:12px;padding:20px;text-align:center;margin-bottom:12px}'
+              '.price{font-size:42px;font-weight:800;color:#FFD700}'
+              '.sub{font-size:14px;color:#888;margin-top:6px}'
+              '.bbox{background:#1a1a1a;border-radius:12px;padding:20px;text-align:center;margin-bottom:12px}'
+              '.blbl{color:#888;font-size:13px;margin-bottom:8px}'
+              '.bias{font-size:38px;font-weight:800;color:' + bias_color + '}'
+              '.conf{display:inline-block;margin-top:8px;padding:4px 14px;background:#2a2a2a;border-radius:20px;font-size:13px;color:#aaa}'
+              '.sec{background:#1a1a1a;border-radius:12px;padding:16px;margin-bottom:12px}'
+              '.stitle{color:#FFD700;font-size:14px;font-weight:600;margin-bottom:10px;border-bottom:1px solid #2a2a2a;padding-bottom:8px}'
+              'ul{list-style:none}'
+              'li{padding:7px 0;border-bottom:1px solid #1e1e1e;font-size:14px;color:#ccc}'
+              'li:last-child{border-bottom:none}'
+              'li::before{content:"\25B6";color:#FFD700;margin-right:8px;font-size:11px}'
+              '.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}'
+              '.lv{background:#0f0f0f;border-radius:8px;padding:12px;text-align:center}'
+              '.ll{font-size:12px;color:#888;margin-bottom:4px}'
+              '.lr{font-size:18px;font-weight:700;color:#ff6b6b}'
+              '.ls{font-size:18px;font-weight:700;color:#51cf66}'
+              '.strat{background:#1a1a1a;border:1px solid #FFD700;border-radius:12px;padding:16px;margin-bottom:12px;text-align:center;color:#FFD700;font-size:15px;font-weight:500}'
+              '.footer{text-align:center;color:#444;font-size:12px;padding:8px}'
+              '</style></head><body><div class="card">'
+              '<div class="header"><h1>XAU/USD</h1><div class="dt">' + date_str + '</div></div>'
+              '<div class="pbox"><div class="price">$' + '{:,.2f}'.format(gold) + '</div>'
+              '<div class="sub">DXY ' + str(dxy) + ' &bull; ' + dxy_cn + '</div></div>'
+              '<div class="bbox"><div class="blbl">每日偏见</div>'
+              '<div class="bias">' + bias_cn + '</div>'
+              '<div class="conf">置信度：中</div></div>'
+              '<div class="sec"><div class="stitle">基本面 (4)</div><ul>' + li(fund) + '</ul></div>'
+              '<div class="sec"><div class="stitle">技术面 (2)</div><ul>' + li(tech) + '</ul></div>'
+              '<div class="sec"><div class="stitle">价位参考</div><div class="grid">'
+              '<div class="lv"><div class="ll">R2 阻力</div><div class="lr">' + str(r2) + '</div></div>'
+              '<div class="lv"><div class="ll">R1 阻力</div><div class="lr">' + str(r1) + '</div></div>'
+              '<div class="lv"><div class="ll">S1 支撑</div><div class="ls">' + str(s1) + '</div></div>'
+              '<div class="lv"><div class="ll">S2 支撑</div><div class="ls">' + str(s2) + '</div></div>'
+              '</div></div>'
+              '<div class="strat">' + strat + '</div>'
+              '<div class="footer">数据来源：Yahoo Finance &bull; DeepSeek &bull; 仅供参考</div>'
+              '</div></body></html>')
+
+          # 6. Write
+          os.makedirs('XAUUSD', exist_ok=True)
+          fname = 'XAUUSD/' + date_str + '.html'
+          with open(fname, 'w', encoding='utf-8') as f:
+              f.write(html)
+          with open('XAUUSD/latest.html', 'w', encoding='utf-8') as f:
+              f.write(html)
+
+          # 7. Git push
+          subprocess.run(['git', 'config', 'user.email', 'action@github.com'], check=True)
+          subprocess.run(['git', 'config', 'user.name',  'GitHub Actions'],    check=True)
+          subprocess.run(['git', 'add', fname, 'XAUUSD/latest.html'],          check=True)
+          diff = subprocess.run(['git', 'diff', '--cached', '--quiet'])
+          if diff.returncode != 0:
+              subprocess.run(['git', 'commit', '-m', 'XAUUSD ' + date_str], check=True)
+              subprocess.run(['git', 'push'], check=True)
+
+          # 8. Telegram
+          tg = os.environ.get('TELEGRAM_TOKEN', '')
+          if tg:
+              page_url = 'https://ctsy0225.github.io/qqqm-monitor/XAUUSD/latest.html'
+              msg  = 'XAU/USD ' + date_str + '\n' + page_url
+              data = json.dumps({'chat_id': '6454973171', 'text': msg}).encode()
+              tg_req = urllib.request.Request(
+                  'https://api.telegram.org/bot' + tg + '/sendMessage',
+                  data=data, headers={'Content-Type': 'application/json'})
+              with urllib.request.urlopen(tg_req) as resp:
+                  print('Telegram:', json.loads(resp.read()).get('ok'))
+          print('DONE:', gold)
+          PYEOF
