@@ -113,6 +113,11 @@ jobs:
                            '关键支撑 ' + str(s1) + '，跌破可看 ' + str(s2)]
                   strat = '空头思路，反弹 ' + str(r1) + ' 附近关注卖出'
 
+          # 5. Git pull first (before writing files)
+          subprocess.run(['git', 'config', 'user.email', 'action@github.com'], check=True)
+          subprocess.run(['git', 'config', 'user.name',  'GitHub Actions'],    check=True)
+          subprocess.run(['git', 'pull', '--rebase', 'origin', 'main'], check=True)
+
           # 5. HTML — arrow is inline span, no CSS escape needed
           arr = '<span class="arr">&#9654;</span>'
           li  = lambda xs: ''.join('<li>' + arr + '<span>' + x + '</span></li>' for x in xs)
@@ -178,7 +183,6 @@ jobs:
           # 7. Git push
           subprocess.run(['git', 'config', 'user.email', 'action@github.com'], check=True)
           subprocess.run(['git', 'config', 'user.name',  'GitHub Actions'],    check=True)
-          subprocess.run(['git', 'pull',   '--rebase', 'origin', 'main'],       check=True)
           subprocess.run(['git', 'add', fname, 'XAUUSD/latest.html'],           check=True)
           diff = subprocess.run(['git', 'diff', '--cached', '--quiet'])
           if diff.returncode != 0:
