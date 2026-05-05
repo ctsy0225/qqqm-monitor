@@ -64,7 +64,7 @@ jobs:
           bias_color = '#00c853' if dxy_dir == 'falling' else '#ff1744'
           dxy_cn     = '下行' if dxy_dir == 'falling' else '上行'
 
-          # 4. Economic calendar (ForexFactory, no API key needed)
+          # 4. Economic calendar with directional scoring (ForexFactory)
           events_html = ''
           try:
               cal_req = urllib.request.Request(
@@ -72,31 +72,111 @@ jobs:
                   headers={'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'})
               with urllib.request.urlopen(cal_req, timeout=10) as r:
                   calendar = json.loads(r.read())
-              upcoming = []
+
+              def parse_val(s):
+                  if not s or not s.strip():
+                      return None
+                  s = s.strip().replace(',', '').replace('$', '').replace('%', '')
+                  mult = 1
+                  if s.upper().endswith('K'):
+                      mult, s = 1000, s[:-1]
+                  elif s.upper().endswith('M'):
+                      mult, s = 1000000, s[:-1]
+                  elif s.upper().endswith('B'):
+                      mult, s = 1000000000, s[:-1]
+                  try:
+                      return float(s) * mult
+                  except Exception:
+                      return None
+
+              def score_event(title, fc, pv):
+                  f, p = parse_val(fc), parse_val(pv)
+                  t = title.lower()
+                  if any(k in t for k in ['fomc', 'federal funds', 'powell', 'fed chair', 'minutes']):
+                      return 3, 0, '高度关注'
+                  if f is None or p is None:
+                      return 1, 0, ''
+                  stronger = f > p
+                  if any(k in t for k in ['nonfarm', 'payroll', 'gdp', 'ism', 'retail sales', 'durable']):
+                      w = 3 if 'nonfarm' in t or 'payroll' in t else 2
+                      d = -1 if stronger else 1
+                      hint = ('预期强于前值，利空金' if d == -1 else '预期弱于前值，利好金')
+                      return w, d, hint
+                  if any(k in t for k in ['cpi', 'pce', 'ppi', 'inflation']):
+                      d = -1 if stronger else 1
+                      hint = ('通胀预期升，短期利空金' if d == -1 else '通胀预期降，短期利好金')
+                      return 2, d, hint
+                  if any(k in t for k in ['jobless', 'unemployment', 'claims']):
+                      d = 1 if stronger else -1
+                      hint = ('就业走弱，利好金' if d == 1 else '就业强劲，利空金')
+                      return 2, d, hint
+                  return 1, 0, ''
+
+              today_evs = []
+              soon_evs  = []
+              total_w, net_score = 0, 0
+
               for ev in calendar:
-                  if ev.get('country') != 'USD':
-                      continue
-                  if ev.get('impact') != 'High':
+                  if ev.get('country') != 'USD' or ev.get('impact') != 'High':
                       continue
                   ev_date_str = ev.get('date', '')[:10]
                   try:
-                      ev_date = date_type.fromisoformat(ev_date_str)
+                      ev_date   = date_type.fromisoformat(ev_date_str)
                       days_away = (ev_date - today).days
-                      if 0 <= days_away <= 3:
-                          label = '今天' if days_away == 0 else ('明天' if days_away == 1 else str(days_away) + '天后')
-                          upcoming.append((ev.get('title', ''), label))
                   except Exception:
-                      pass
-              if upcoming:
-                  rows = ''.join(
-                      '<div class="ev-row"><span class="ev-name">' + t + '</span>'
-                      '<span class="ev-tag">' + lbl + '</span></div>'
-                      for t, lbl in upcoming)
+                      continue
+                  if days_away < 0 or days_away > 4:
+                      continue
+                  title = ev.get('title', '')
+                  fc    = ev.get('forecast', '')
+                  pv    = ev.get('previous', '')
+                  w, d, hint = score_event(title, fc, pv)
+                  ev_time = ev.get('time', '')[:5]
+                  if days_away == 0:
+                      today_evs.append((title, fc, pv, ev_time, hint, d))
+                      total_w  += w
+                      net_score += w * d
+                  else:
+                      label = '明天' if days_away == 1 else str(days_away) + '天后'
+                      soon_evs.append((title, label))
+
+              if today_evs or soon_evs:
+                  rows = ''
+                  for title, fc, pv, ev_time, hint, d in today_evs:
+                      fc_txt = ('预测 ' + fc) if fc else '预测 —'
+                      pv_txt = ('前值 ' + pv) if pv else '前值 —'
+                      hint_html = ('<span class="ev-hint ' + ('ev-bear' if d < 0 else ('ev-bull' if d > 0 else 'ev-watch')) + '">' + hint + '</span>') if hint else ''
+                      rows += ('<div class="ev-row">'
+                               '<div class="ev-left"><span class="ev-name">' + title + '</span>'
+                               + hint_html + '</div>'
+                               '<div class="ev-right"><span class="ev-num">' + fc_txt + '</span>'
+                               '<span class="ev-num ev-prev">' + pv_txt + '</span>'
+                               '<span class="ev-time">' + ev_time + '</span></div></div>')
+                  for title, label in soon_evs:
+                      rows += ('<div class="ev-row ev-soon">'
+                               '<span class="ev-name">' + title + '</span>'
+                               '<span class="ev-tag">' + label + '</span></div>')
+
+                  if total_w > 0:
+                      ratio = net_score / total_w
+                      if ratio > 0.25:
+                          verdict_txt   = '数据面倾向：利好黄金 &#9650;'
+                          verdict_cls   = 'ev-bull'
+                      elif ratio < -0.25:
+                          verdict_txt   = '数据面倾向：利空黄金 &#9660;'
+                          verdict_cls   = 'ev-bear'
+                      else:
+                          verdict_txt   = '数据面倾向：方向中性 &#9644;'
+                          verdict_cls   = 'ev-watch'
+                      verdict_html = '<div class="evt-verdict ' + verdict_cls + '">' + verdict_txt + '</div>'
+                  else:
+                      verdict_html = '<div class="evt-verdict ev-watch">含 FOMC / 讲话，方向待定</div>'
+
                   events_html = (
                       '<div class="evt">'
-                      '<div class="evt-hdr">&#9888; 近期重大数据（USD）</div>'
-                      + rows + '</div>')
-              print('Calendar OK, upcoming:', len(upcoming))
+                      '<div class="evt-hdr">&#9888; 今日及近期重大数据（USD）</div>'
+                      + rows + verdict_html + '</div>')
+              print('Calendar OK, today:', len(today_evs), 'soon:', len(soon_evs))
           except Exception as e:
               print('Calendar failed:', e)
 
@@ -164,12 +244,23 @@ jobs:
               '.pbox{background:#1a1a1a;border-radius:12px;padding:20px;text-align:center;margin-bottom:12px}'
               '.price{font-size:42px;font-weight:800;color:#FFD700}'
               '.sub{font-size:14px;color:#888;margin-top:6px}'
-              '.evt{background:#1f1010;border:1px solid #ff6b6b;border-radius:12px;padding:16px;margin-bottom:12px}'
+              '.evt{background:#1a1212;border:1px solid #ff6b6b;border-radius:12px;padding:16px;margin-bottom:12px}'
               '.evt-hdr{color:#ff6b6b;font-size:13px;font-weight:600;margin-bottom:10px}'
-              '.ev-row{display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid #2a1a1a;font-size:13px;color:#ccc}'
+              '.ev-row{display:flex;justify-content:space-between;align-items:flex-start;padding:7px 0;border-bottom:1px solid #2a1a1a;gap:8px}'
               '.ev-row:last-child{border-bottom:none}'
-              '.ev-name{flex:1;padding-right:8px}'
+              '.ev-left{display:flex;flex-direction:column;gap:3px;flex:1;min-width:0}'
+              '.ev-right{display:flex;flex-direction:column;align-items:flex-end;gap:2px;white-space:nowrap}'
+              '.ev-name{font-size:13px;color:#ddd;font-weight:500}'
+              '.ev-hint{font-size:11px;font-weight:600;padding:1px 0}'
+              '.ev-bull{color:#51cf66}'
+              '.ev-bear{color:#ff6b6b}'
+              '.ev-watch{color:#ffa94d}'
+              '.ev-num{font-size:11px;color:#aaa}'
+              '.ev-prev{color:#666}'
+              '.ev-time{font-size:10px;color:#555;margin-top:1px}'
+              '.ev-soon{align-items:center}'
               '.ev-tag{color:#ffa94d;font-size:11px;font-weight:700;background:#2a1800;padding:2px 8px;border-radius:10px;white-space:nowrap}'
+              '.evt-verdict{margin-top:10px;padding:8px 12px;border-radius:8px;font-size:13px;font-weight:600;text-align:center;background:#111}'
               '.bbox{background:#1a1a1a;border-radius:12px;padding:20px;text-align:center;margin-bottom:12px}'
               '.blbl{color:#888;font-size:13px;margin-bottom:8px}'
               '.bias{font-size:38px;font-weight:800}'
