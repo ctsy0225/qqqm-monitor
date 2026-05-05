@@ -22,10 +22,11 @@ jobs:
         run: |
           python3 <<'PYEOF'
           import urllib.request, json, os, subprocess
-          from datetime import datetime, timezone, timedelta
+          from datetime import datetime, timezone, timedelta, date as date_type
 
           beijing_tz = timezone(timedelta(hours=8))
-          today    = datetime.now(beijing_tz).date()
+          now_bj   = datetime.now(beijing_tz)
+          today    = now_bj.date()
           date_str = str(today.day) + '-' + str(today.month) + '-' + str(today.year)
 
           # 1. Gold price
@@ -63,7 +64,43 @@ jobs:
           bias_color = '#00c853' if dxy_dir == 'falling' else '#ff1744'
           dxy_cn     = '下行' if dxy_dir == 'falling' else '上行'
 
-          # 4. DeepSeek
+          # 4. Economic calendar (ForexFactory, no API key needed)
+          events_html = ''
+          try:
+              cal_req = urllib.request.Request(
+                  'https://nfs.faireconomy.media/ff_calendar_thisweek.json',
+                  headers={'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'})
+              with urllib.request.urlopen(cal_req, timeout=10) as r:
+                  calendar = json.loads(r.read())
+              upcoming = []
+              for ev in calendar:
+                  if ev.get('country') != 'USD':
+                      continue
+                  if ev.get('impact') != 'High':
+                      continue
+                  ev_date_str = ev.get('date', '')[:10]
+                  try:
+                      ev_date = date_type.fromisoformat(ev_date_str)
+                      days_away = (ev_date - today).days
+                      if 0 <= days_away <= 3:
+                          label = '今天' if days_away == 0 else ('明天' if days_away == 1 else str(days_away) + '天后')
+                          upcoming.append((ev.get('title', ''), label))
+                  except Exception:
+                      pass
+              if upcoming:
+                  rows = ''.join(
+                      '<div class="ev-row"><span class="ev-name">' + t + '</span>'
+                      '<span class="ev-tag">' + lbl + '</span></div>'
+                      for t, lbl in upcoming)
+                  events_html = (
+                      '<div class="evt">'
+                      '<div class="evt-hdr">&#9888; 近期重大数据（USD）</div>'
+                      + rows + '</div>')
+              print('Calendar OK, upcoming:', len(upcoming))
+          except Exception as e:
+              print('Calendar failed:', e)
+
+          # 5. DeepSeek
           fund, tech, strat = [], [], ''
           ds_key = os.environ.get('DEEPSEEK_API_KEY', '')
           if ds_key:
@@ -113,12 +150,7 @@ jobs:
                            '关键支撑 ' + str(s1) + '，跌破可看 ' + str(s2)]
                   strat = '空头思路，反弹 ' + str(r1) + ' 附近关注卖出'
 
-          # 5. Git pull first (before writing files)
-          subprocess.run(['git', 'config', 'user.email', 'action@github.com'], check=True)
-          subprocess.run(['git', 'config', 'user.name',  'GitHub Actions'],    check=True)
-          subprocess.run(['git', 'pull', '--rebase', 'origin', 'main'], check=True)
-
-          # 5. HTML — arrow is inline span, no CSS escape needed
+          # 6. HTML
           arr = '<span class="arr">&#9654;</span>'
           li  = lambda xs: ''.join('<li>' + arr + '<span>' + x + '</span></li>' for x in xs)
 
@@ -132,6 +164,12 @@ jobs:
               '.pbox{background:#1a1a1a;border-radius:12px;padding:20px;text-align:center;margin-bottom:12px}'
               '.price{font-size:42px;font-weight:800;color:#FFD700}'
               '.sub{font-size:14px;color:#888;margin-top:6px}'
+              '.evt{background:#1f1010;border:1px solid #ff6b6b;border-radius:12px;padding:16px;margin-bottom:12px}'
+              '.evt-hdr{color:#ff6b6b;font-size:13px;font-weight:600;margin-bottom:10px}'
+              '.ev-row{display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid #2a1a1a;font-size:13px;color:#ccc}'
+              '.ev-row:last-child{border-bottom:none}'
+              '.ev-name{flex:1;padding-right:8px}'
+              '.ev-tag{color:#ffa94d;font-size:11px;font-weight:700;background:#2a1800;padding:2px 8px;border-radius:10px;white-space:nowrap}'
               '.bbox{background:#1a1a1a;border-radius:12px;padding:20px;text-align:center;margin-bottom:12px}'
               '.blbl{color:#888;font-size:13px;margin-bottom:8px}'
               '.bias{font-size:38px;font-weight:800}'
@@ -157,6 +195,7 @@ jobs:
               '<div class="header"><h1>XAU/USD</h1><div class="dt">' + date_str + '</div></div>'
               '<div class="pbox"><div class="price">$' + '{:,.2f}'.format(gold) + '</div>'
               '<div class="sub">DXY ' + str(dxy) + ' &bull; ' + dxy_cn + '</div></div>'
+              + events_html +
               '<div class="bbox"><div class="blbl">每日偏见</div>'
               '<div class="bias" style="color:' + bias_color + '">' + bias_cn + '</div>'
               '<div class="conf">置信度：中</div></div>'
@@ -169,10 +208,10 @@ jobs:
               '<div class="lv"><div class="ll">S2 支撑</div><div class="ls">' + str(s2) + '</div></div>'
               '</div></div>'
               '<div class="strat">' + strat + '</div>'
-              '<div class="footer">数据来源：Yahoo Finance &bull; DeepSeek &bull; 仅供参考</div>'
+              '<div class="footer">数据来源：Yahoo Finance &bull; ForexFactory &bull; DeepSeek &bull; 仅供参考</div>'
               '</div></body></html>')
 
-          # 6. Write
+          # 7. Write
           os.makedirs('XAUUSD', exist_ok=True)
           fname = 'XAUUSD/' + date_str + '.html'
           with open(fname, 'w', encoding='utf-8') as f:
@@ -180,16 +219,17 @@ jobs:
           with open('XAUUSD/latest.html', 'w', encoding='utf-8') as f:
               f.write(html)
 
-          # 7. Git push
+          # 8. Git push
           subprocess.run(['git', 'config', 'user.email', 'action@github.com'], check=True)
           subprocess.run(['git', 'config', 'user.name',  'GitHub Actions'],    check=True)
+          subprocess.run(['git', 'pull',   '--rebase', 'origin', 'main'],       check=True)
           subprocess.run(['git', 'add', fname, 'XAUUSD/latest.html'],           check=True)
           diff = subprocess.run(['git', 'diff', '--cached', '--quiet'])
           if diff.returncode != 0:
               subprocess.run(['git', 'commit', '-m', 'XAUUSD ' + date_str], check=True)
               subprocess.run(['git', 'push'], check=True)
 
-          # 8. Telegram
+          # 9. Telegram
           tg = os.environ.get('TELEGRAM_TOKEN', '')
           if tg:
               page_url = 'https://ctsy0225.github.io/qqqm-monitor/XAUUSD/latest.html'
