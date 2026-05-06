@@ -302,18 +302,18 @@ jobs:
               '<div class="footer">数据来源：Yahoo Finance &bull; ForexFactory &bull; DeepSeek &bull; 仅供参考</div>'
               '</div></body></html>')
 
-          # 7. Write
+          # 7. Git pull FIRST (before writing any files)
+          subprocess.run(['git', 'config', 'user.email', 'action@github.com'], check=True)
+          subprocess.run(['git', 'config', 'user.name',  'GitHub Actions'],    check=True)
+          subprocess.run(['git', 'pull',   '--rebase', 'origin', 'main'],       check=True)
+
+          # 8. Write files (after pull, no unstaged changes issue)
           os.makedirs('XAUUSD', exist_ok=True)
           fname = 'XAUUSD/' + date_str + '.html'
           with open(fname, 'w', encoding='utf-8') as f:
               f.write(html)
           with open('XAUUSD/latest.html', 'w', encoding='utf-8') as f:
               f.write(html)
-
-          # 8. Git push
-          subprocess.run(['git', 'config', 'user.email', 'action@github.com'], check=True)
-          subprocess.run(['git', 'config', 'user.name',  'GitHub Actions'],    check=True)
-          subprocess.run(['git', 'pull',   '--rebase', 'origin', 'main'],       check=True)
           subprocess.run(['git', 'add', fname, 'XAUUSD/latest.html'],           check=True)
           diff = subprocess.run(['git', 'diff', '--cached', '--quiet'])
           if diff.returncode != 0:
