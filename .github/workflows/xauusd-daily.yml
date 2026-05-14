@@ -181,25 +181,32 @@ jobs:
               # Detect FOMC among today's events
               has_fomc = any('fomc' in t.lower() or 'federal funds' in t.lower()
                              for t, fc, pv, ev_time, hint, d in today_evs)
-              # Confidence: based on DXY move strength + calendar alignment
+              # Confidence: DXY move strength + calendar alignment
+              # Typical DXY daily range: <0.10%=flat, 0.10-0.30%=normal, >0.30%=strong
               if has_fomc:
                   conf_label = '低'
-              elif dxy_move_pct < 0.08:
-                  conf_label = '低'
+              elif dxy_move_pct < 0.10:
+                  conf_label = '低'   # DXY barely moved, signal weak
               elif total_w > 0:
-                  cal_ratio  = net_score / total_w
-                  cal_bull   = cal_ratio > 0.25
-                  cal_bear   = cal_ratio < -0.25
-                  dxy_bull   = (dxy_dir == 'falling')
-                  dxy_bear   = (dxy_dir == 'rising')
+                  cal_ratio = net_score / total_w
+                  cal_bull  = cal_ratio > 0.25
+                  cal_bear  = cal_ratio < -0.25
+                  dxy_bull  = (dxy_dir == 'falling')
+                  dxy_bear  = (dxy_dir == 'rising')
                   if (cal_bull and dxy_bull) or (cal_bear and dxy_bear):
-                      conf_label = '高' if dxy_move_pct > 0.3 else '中'
+                      conf_label = '高'   # calendar + DXY agree
                   elif (cal_bull and dxy_bear) or (cal_bear and dxy_bull):
-                      conf_label = '低'
+                      conf_label = '低'   # calendar conflicts with DXY
                   else:
-                      conf_label = '中'
+                      conf_label = '中' if dxy_move_pct > 0.20 else '低'
               else:
-                  conf_label = '高' if dxy_move_pct > 0.5 else '中'
+                  # No major events today — rely on DXY move magnitude
+                  if dxy_move_pct > 0.30:
+                      conf_label = '高'
+                  elif dxy_move_pct > 0.10:
+                      conf_label = '中'
+                  else:
+                      conf_label = '低'
               print('Calendar OK, today:', len(today_evs), 'soon:', len(soon_evs), 'conf:', conf_label)
           except Exception as e:
               conf_label = '中'
@@ -211,14 +218,17 @@ jobs:
           ds_key = os.environ.get('DEEPSEEK_API_KEY', '')
           if ds_key:
               try:
-                  bias_instr = ('Strategy MUST suggest selling/shorting near resistance.' if bias_en == 'BEARISH'
-                                else 'Strategy MUST suggest buying/longing near support.' if bias_en == 'BULLISH'
-                                else 'Strategy should be cautious, wait for direction.')
+                  if bias_en == 'BEARISH':
+                      bias_instr = 'Strategy MUST start with a sell/short idea (e.g. 反弹至R1做空). NEVER suggest buying.'
+                  elif bias_en == 'BULLISH':
+                      bias_instr = 'Strategy MUST start with a buy/long idea (e.g. 回调至S1做多). NEVER suggest selling.'
+                  else:
+                      bias_instr = 'Strategy should say wait for clearer direction.'
                   prompt = ('Gold: XAU/USD=' + str(gold) + ' DXY=' + str(dxy) + '(' + dxy_dir + ')' +
                       ' R2=' + str(r2) + ' R1=' + str(r1) + ' S1=' + str(s1) + ' S2=' + str(s2) +
                       ' DailyBias=' + bias_en +
-                      '\nWrite Chinese gold analysis CONSISTENT with ' + bias_en + ' bias. ' + bias_instr +
-                      ' Respond ONLY valid JSON no markdown:\n' +
+                      '\nIMPORTANT: ' + bias_instr +
+                      ' Write Chinese gold analysis. Respond ONLY valid JSON no markdown:\n' +
                       '{"fundamental":["pt1","pt2","pt3","pt4"],"technical":["pt1","pt2"],"strategy":"one line"}\n' +
                       'Each point <28 Chinese chars. Strategy <35 chars.')
                   ds_data = json.dumps({'model': 'deepseek-chat',
