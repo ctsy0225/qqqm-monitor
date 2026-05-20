@@ -79,7 +79,13 @@ jobs:
               rsi_state, rsi_color = '超卖', '#51cf66'
           else:
               rsi_state, rsi_color = '中性', '#aaa'
-          print('ATR:', atr, 'RSI:', rsi, rsi_state)
+          # Trend strength signals (for range detection)
+          ma20 = sum(closes[-20:]) / min(len(closes), 20)
+          price_vs_ma20 = abs((gold - ma20) / ma20 * 100) if ma20 else 0
+          recent_high = max(highs[-5:]) if len(highs) >= 5 else gold
+          recent_low  = min(lows[-5:])  if len(lows)  >= 5 else gold
+          range_5d_pct = (recent_high - recent_low) / gold * 100 if gold else 0
+          print('ATR:', atr, 'RSI:', rsi, rsi_state, '5d_range%:', round(range_5d_pct,2), 'vsMA20%:', round(price_vs_ma20,2))
 
           # 2. DXY
           try:
@@ -129,14 +135,24 @@ jobs:
           if rsi >= 70: score -= 0.5
           elif rsi <= 30: score += 0.5
 
-          if score >= 1:
+          # Range detection: all conditions met = no trend
+          is_ranging = (
+              abs(score) < 1 and
+              price_vs_ma20 < 0.5 and
+              40 < rsi < 60 and
+              range_5d_pct < 2.0
+          )
+
+          if is_ranging:
+              bias_cn, bias_color = '震荡', '#ffa94d'
+          elif score >= 1:
               bias_cn, bias_color = '做多', '#00c853'
           elif score <= -1:
               bias_cn, bias_color = '做空', '#ff1744'
           else:
               bias_cn, bias_color = '中性', '#aaa'
           dxy_cn = '下行' if dxy_dir == 'falling' else ('上行' if dxy_dir == 'rising' else '持平')
-          print('Bias score:', score, '→', bias_cn)
+          print('Bias score:', score, '→', bias_cn, '(ranging:', is_ranging, ')')
 
           # 4. Economic calendar with directional scoring (ForexFactory)
           events_html = ''
@@ -253,18 +269,20 @@ jobs:
               # Detect FOMC among today's events
               has_fomc = any('fomc' in t.lower() or 'federal funds' in t.lower()
                              for t, fc, pv, ev_time, hint, d in today_evs)
-              # Confidence: based on bias score strength (multi-factor agreement)
+              # Confidence: based on bias score strength + range detection
               abs_score = abs(score)
               if has_fomc:
                   conf_label = '低'   # FOMC = high uncertainty
+              elif is_ranging:
+                  conf_label = '中'   # Range identification is itself a clear signal
               elif abs_score >= 2:
-                  conf_label = '高'   # 2+ confirming signals (DXY+TNX agree, etc.)
+                  conf_label = '高'   # 2+ confirming signals
               elif abs_score >= 1:
                   conf_label = '中'   # 1 clear signal
               else:
                   conf_label = '低'   # mixed / weak signals
-              # Calendar conflict downgrades confidence
-              if total_w > 0:
+              # Calendar conflict downgrades confidence (only for directional bias)
+              if total_w > 0 and not is_ranging:
                   cal_ratio = net_score / total_w
                   if (cal_ratio > 0.25 and score < 0) or (cal_ratio < -0.25 and score > 0):
                       conf_label = '低'
@@ -274,7 +292,14 @@ jobs:
               print('Calendar failed:', e)
 
           # 5. DeepSeek (bias-locked: strategy must match daily bias)
-          bias_en = 'BEARISH' if bias_cn == '做空' else ('BULLISH' if bias_cn == '做多' else 'NEUTRAL')
+          if bias_cn == '震荡':
+              bias_en = 'RANGING'
+          elif bias_cn == '做空':
+              bias_en = 'BEARISH'
+          elif bias_cn == '做多':
+              bias_en = 'BULLISH'
+          else:
+              bias_en = 'NEUTRAL'
           fund, tech, strat = [], [], ''
           ds_key = os.environ.get('DEEPSEEK_API_KEY', '')
           if ds_key:
@@ -283,6 +308,10 @@ jobs:
                       bias_instr = 'Strategy MUST start with a sell/short idea (e.g. 反弹至R1做空). NEVER suggest buying.'
                   elif bias_en == 'BULLISH':
                       bias_instr = 'Strategy MUST start with a buy/long idea (e.g. 回调至S1做多). NEVER suggest selling.'
+                  elif bias_en == 'RANGING':
+                      bias_instr = ('Market is RANGING (low volatility, no direction). Strategy MUST suggest range trading: '
+                                    'e.g. "区间' + str(s1) + '-' + str(r1) + '内高抛低吸，突破后顺势". '
+                                    'Do NOT suggest a one-way directional bet.')
                   else:
                       bias_instr = 'Strategy should say wait for clearer direction.'
                   prompt = ('Gold: XAU/USD=' + str(gold) +
