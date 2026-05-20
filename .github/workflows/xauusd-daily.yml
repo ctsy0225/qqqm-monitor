@@ -29,17 +29,57 @@ jobs:
           today    = now_bj.date()
           date_str = str(today.day) + '-' + str(today.month) + '-' + str(today.year)
 
-          # 1. Gold price
+          # 1. Gold OHLC (30 days for ATR/RSI)
           req = urllib.request.Request(
-              'https://query1.finance.yahoo.com/v8/finance/chart/GC%3DF?interval=1d&range=2d',
+              'https://query1.finance.yahoo.com/v8/finance/chart/GC%3DF?interval=1d&range=30d',
               headers={'User-Agent': 'Mozilla/5.0'})
           with urllib.request.urlopen(req, timeout=15) as r:
               d = json.loads(r.read())
-          prices = [p for p in d['chart']['result'][0]['indicators']['quote'][0]['close'] if p]
-          gold = round(prices[-1], 2)
-          print('GOLD:', gold)
+          q = d['chart']['result'][0]['indicators']['quote'][0]
+          bars = [(h, l, c) for h, l, c in zip(q['high'], q['low'], q['close'])
+                  if h is not None and l is not None and c is not None]
+          highs  = [b[0] for b in bars]
+          lows   = [b[1] for b in bars]
+          closes = [b[2] for b in bars]
+          gold = round(closes[-1], 2)
+          print('GOLD:', gold, 'bars:', len(bars))
           if gold < 3000:
               raise Exception('Invalid gold price: ' + str(gold))
+
+          # 1.5 Technical indicators (ATR + RSI)
+          def calc_atr(h, l, c, period=14):
+              trs = []
+              for i in range(1, len(h)):
+                  tr = max(h[i] - l[i], abs(h[i] - c[i-1]), abs(l[i] - c[i-1]))
+                  trs.append(tr)
+              if not trs:
+                  return 0
+              return sum(trs[-period:]) / min(len(trs), period)
+
+          def calc_rsi(c, period=14):
+              if len(c) < period + 1:
+                  return 50.0
+              gains, losses = [], []
+              for i in range(1, len(c)):
+                  diff = c[i] - c[i-1]
+                  gains.append(max(diff, 0))
+                  losses.append(max(-diff, 0))
+              avg_g = sum(gains[-period:]) / period
+              avg_l = sum(losses[-period:]) / period
+              if avg_l == 0:
+                  return 100.0
+              rs = avg_g / avg_l
+              return 100 - (100 / (1 + rs))
+
+          atr = round(calc_atr(highs, lows, closes), 2)
+          rsi = round(calc_rsi(closes), 1)
+          if rsi >= 70:
+              rsi_state, rsi_color = '超买', '#ff6b6b'
+          elif rsi <= 30:
+              rsi_state, rsi_color = '超卖', '#51cf66'
+          else:
+              rsi_state, rsi_color = '中性', '#aaa'
+          print('ATR:', atr, 'RSI:', rsi, rsi_state)
 
           # 2. DXY
           try:
@@ -57,14 +97,46 @@ jobs:
               dxy, dxy_prev, dxy_dir, dxy_move_pct = 99.0, 99.0, 'unknown', 0.0
               print('DXY fallback:', e)
 
-          # 3. Levels
-          r2 = round(gold + 45, 1)
-          r1 = round(gold + 20, 1)
-          s1 = round(gold - 20, 1)
-          s2 = round(gold - 45, 1)
-          bias_cn    = '做多' if dxy_dir == 'falling' else ('做空' if dxy_dir == 'rising' else '中性')
-          bias_color = '#00c853' if dxy_dir == 'falling' else '#ff1744'
-          dxy_cn     = '下行' if dxy_dir == 'falling' else '上行'
+          # 2.5 US10Y yield (^TNX) — key gold driver
+          try:
+              tnx_req = urllib.request.Request(
+                  'https://query1.finance.yahoo.com/v8/finance/chart/%5ETNX?interval=1d&range=5d',
+                  headers={'User-Agent': 'Mozilla/5.0'})
+              with urllib.request.urlopen(tnx_req, timeout=15) as r:
+                  tnx_d = json.loads(r.read())
+              tnx_list = [p for p in tnx_d['chart']['result'][0]['indicators']['quote'][0]['close'] if p]
+              tnx        = round(tnx_list[-1], 3)
+              tnx_prev   = round(tnx_list[-2], 3) if len(tnx_list) >= 2 else tnx
+              tnx_dir    = 'rising' if tnx > tnx_prev else ('falling' if tnx < tnx_prev else 'flat')
+              tnx_chg_pct = abs((tnx - tnx_prev) / tnx_prev * 100) if tnx_prev else 0
+              tnx_cn     = '上行' if tnx_dir == 'rising' else ('下行' if tnx_dir == 'falling' else '持平')
+          except Exception as e:
+              tnx, tnx_prev, tnx_dir, tnx_chg_pct, tnx_cn = 4.0, 4.0, 'unknown', 0.0, '未知'
+              print('TNX fallback:', e)
+
+          # 3. Dynamic S/R from ATR + multi-factor bias
+          r1 = round(gold + atr * 0.5, 1)
+          r2 = round(gold + atr * 1.2, 1)
+          s1 = round(gold - atr * 0.5, 1)
+          s2 = round(gold - atr * 1.2, 1)
+
+          # Multi-factor bias score: DXY + US10Y + RSI extreme
+          score = 0.0
+          if dxy_dir == 'falling': score += 1
+          elif dxy_dir == 'rising': score -= 1
+          if tnx_dir == 'falling': score += 1
+          elif tnx_dir == 'rising': score -= 1
+          if rsi >= 70: score -= 0.5
+          elif rsi <= 30: score += 0.5
+
+          if score >= 1:
+              bias_cn, bias_color = '做多', '#00c853'
+          elif score <= -1:
+              bias_cn, bias_color = '做空', '#ff1744'
+          else:
+              bias_cn, bias_color = '中性', '#aaa'
+          dxy_cn = '下行' if dxy_dir == 'falling' else ('上行' if dxy_dir == 'rising' else '持平')
+          print('Bias score:', score, '→', bias_cn)
 
           # 4. Economic calendar with directional scoring (ForexFactory)
           events_html = ''
@@ -181,31 +253,20 @@ jobs:
               # Detect FOMC among today's events
               has_fomc = any('fomc' in t.lower() or 'federal funds' in t.lower()
                              for t, fc, pv, ev_time, hint, d in today_evs)
-              # Confidence: DXY move strength + calendar alignment
-              # Typical DXY daily range: <0.10%=flat, 0.10-0.30%=normal, >0.30%=strong
+              # Confidence: based on bias score strength (multi-factor agreement)
+              abs_score = abs(score)
               if has_fomc:
-                  conf_label = '低'
-              elif dxy_move_pct < 0.10:
-                  conf_label = '低'   # DXY barely moved, signal weak
-              elif total_w > 0:
-                  cal_ratio = net_score / total_w
-                  cal_bull  = cal_ratio > 0.25
-                  cal_bear  = cal_ratio < -0.25
-                  dxy_bull  = (dxy_dir == 'falling')
-                  dxy_bear  = (dxy_dir == 'rising')
-                  if (cal_bull and dxy_bull) or (cal_bear and dxy_bear):
-                      conf_label = '高'   # calendar + DXY agree
-                  elif (cal_bull and dxy_bear) or (cal_bear and dxy_bull):
-                      conf_label = '低'   # calendar conflicts with DXY
-                  else:
-                      conf_label = '中' if dxy_move_pct > 0.20 else '低'
+                  conf_label = '低'   # FOMC = high uncertainty
+              elif abs_score >= 2:
+                  conf_label = '高'   # 2+ confirming signals (DXY+TNX agree, etc.)
+              elif abs_score >= 1:
+                  conf_label = '中'   # 1 clear signal
               else:
-                  # No major events today — rely on DXY move magnitude
-                  if dxy_move_pct > 0.30:
-                      conf_label = '高'
-                  elif dxy_move_pct > 0.10:
-                      conf_label = '中'
-                  else:
+                  conf_label = '低'   # mixed / weak signals
+              # Calendar conflict downgrades confidence
+              if total_w > 0:
+                  cal_ratio = net_score / total_w
+                  if (cal_ratio > 0.25 and score < 0) or (cal_ratio < -0.25 and score > 0):
                       conf_label = '低'
               print('Calendar OK, today:', len(today_evs), 'soon:', len(soon_evs), 'conf:', conf_label)
           except Exception as e:
@@ -224,13 +285,17 @@ jobs:
                       bias_instr = 'Strategy MUST start with a buy/long idea (e.g. 回调至S1做多). NEVER suggest selling.'
                   else:
                       bias_instr = 'Strategy should say wait for clearer direction.'
-                  prompt = ('Gold: XAU/USD=' + str(gold) + ' DXY=' + str(dxy) + '(' + dxy_dir + ')' +
+                  prompt = ('Gold: XAU/USD=' + str(gold) +
+                      ' DXY=' + str(dxy) + '(' + dxy_dir + ')' +
+                      ' US10Y=' + str(tnx) + '%(' + tnx_dir + ')' +
+                      ' RSI14=' + str(rsi) + '(' + rsi_state + ')' +
+                      ' ATR14=' + str(atr) +
                       ' R2=' + str(r2) + ' R1=' + str(r1) + ' S1=' + str(s1) + ' S2=' + str(s2) +
                       ' DailyBias=' + bias_en +
                       '\nIMPORTANT: ' + bias_instr +
-                      ' Write Chinese gold analysis. Respond ONLY valid JSON no markdown:\n' +
+                      ' Use the real indicators (RSI/ATR/US10Y) in the analysis. Write Chinese gold analysis. Respond ONLY valid JSON no markdown:\n' +
                       '{"fundamental":["pt1","pt2","pt3","pt4"],"technical":["pt1","pt2"],"strategy":"one line"}\n' +
-                      'Each point <28 Chinese chars. Strategy <35 chars.')
+                      'Each point <28 Chinese chars. Strategy <35 chars. At least one technical point should mention RSI or ATR.')
                   ds_data = json.dumps({'model': 'deepseek-chat',
                       'messages': [{'role': 'user', 'content': prompt}],
                       'max_tokens': 400}).encode()
@@ -284,6 +349,13 @@ jobs:
               '.pbox{background:#1a1a1a;border-radius:12px;padding:20px;text-align:center;margin-bottom:12px}'
               '.price{font-size:42px;font-weight:800;color:#FFD700}'
               '.sub{font-size:14px;color:#888;margin-top:6px}'
+              '.metrics{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px;margin-bottom:12px}'
+              '.m{background:#1a1a1a;border-radius:8px;padding:10px 4px;text-align:center}'
+              '.m-l{font-size:10px;color:#888;margin-bottom:4px;letter-spacing:0.5px}'
+              '.m-v{font-size:15px;font-weight:700;color:#e0e0e0;margin-bottom:3px}'
+              '.m-d{font-size:10px;color:#888}'
+              '.m-up{color:#51cf66}'
+              '.m-dn{color:#ff6b6b}'
               '.evt{background:#1a1212;border:1px solid #ff6b6b;border-radius:12px;padding:16px;margin-bottom:12px}'
               '.evt-hdr{color:#ff6b6b;font-size:13px;font-weight:600;margin-bottom:10px}'
               '.ev-row{display:flex;justify-content:space-between;align-items:flex-start;padding:7px 0;border-bottom:1px solid #2a1a1a;gap:8px}'
@@ -324,8 +396,17 @@ jobs:
               '<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">'
               '<title>XAU/USD</title><style>' + style + '</style></head><body><div class="card">'
               '<div class="header"><h1>XAU/USD</h1><div class="dt">' + date_str + '</div></div>'
-              '<div class="pbox"><div class="price">$' + '{:,.2f}'.format(gold) + '</div>'
-              '<div class="sub">DXY ' + str(dxy) + ' &bull; ' + dxy_cn + '</div></div>'
+              '<div class="pbox"><div class="price">$' + '{:,.2f}'.format(gold) + '</div></div>'
+              '<div class="metrics">'
+              '<div class="m"><div class="m-l">DXY</div><div class="m-v">' + str(dxy) + '</div>'
+              '<div class="m-d ' + ('m-dn' if dxy_dir == 'falling' else 'm-up' if dxy_dir == 'rising' else '') + '">' + dxy_cn + '</div></div>'
+              '<div class="m"><div class="m-l">US10Y</div><div class="m-v">' + str(tnx) + '%</div>'
+              '<div class="m-d ' + ('m-up' if tnx_dir == 'falling' else 'm-dn' if tnx_dir == 'rising' else '') + '">' + tnx_cn + '</div></div>'
+              '<div class="m"><div class="m-l">RSI 14</div><div class="m-v">' + str(rsi) + '</div>'
+              '<div class="m-d" style="color:' + rsi_color + '">' + rsi_state + '</div></div>'
+              '<div class="m"><div class="m-l">ATR 14</div><div class="m-v">$' + str(atr) + '</div>'
+              '<div class="m-d">日波幅</div></div>'
+              '</div>'
               + events_html +
               '<div class="bbox"><div class="blbl">每日偏见</div>'
               '<div class="bias" style="color:' + bias_color + '">' + bias_cn + '</div>'
