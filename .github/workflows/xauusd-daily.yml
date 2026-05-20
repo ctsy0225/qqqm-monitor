@@ -2,7 +2,8 @@ name: XAUUSD Daily Report
 
 on:
   schedule:
-    - cron: '0 21 * * 0-4'
+    - cron: '0 21 * * 0-4'   # Morning Mon-Fri Beijing 05:00 (UTC 21:00 Sun-Thu)
+    - cron: '0 11 * * 1-5'   # Evening recheck Mon-Fri Beijing 19:00 (UTC 11:00 Mon-Fri)
   workflow_dispatch:
 
 jobs:
@@ -28,6 +29,13 @@ jobs:
           now_bj   = datetime.now(beijing_tz)
           today    = now_bj.date()
           date_str = str(today.day) + '-' + str(today.month) + '-' + str(today.year)
+
+          # Detect recheck mode: UTC hour 10-12 (= Beijing 18-20) means evening recheck
+          utc_now    = datetime.now(timezone.utc)
+          is_pm      = 10 <= utc_now.hour <= 12
+          run_suffix = '-pm' if is_pm else ''
+          title_tag  = ' &middot; 19:00 复评' if is_pm else ''
+          print('Run mode:', 'PM RECHECK' if is_pm else 'AM MORNING')
 
           # 1. Gold OHLC (30 days for ATR/RSI)
           req = urllib.request.Request(
@@ -291,6 +299,106 @@ jobs:
               conf_label = '中'
               print('Calendar failed:', e)
 
+          # 4.5 Volume Profile from intraday GC=F (last 12h = ACC+MAN window)
+          vp_html = ''
+          vp_poc = vp_vah = vp_val = None
+          vp_pos_cn = ''
+          vp_hint = ''
+          try:
+              vp_req = urllib.request.Request(
+                  'https://query1.finance.yahoo.com/v8/finance/chart/GC%3DF?interval=30m&range=2d',
+                  headers={'User-Agent': 'Mozilla/5.0'})
+              with urllib.request.urlopen(vp_req, timeout=15) as r:
+                  vp_d = json.loads(r.read())
+              result = vp_d['chart']['result'][0]
+              tss = result.get('timestamp', [])
+              qvp = result['indicators']['quote'][0]
+              o_a = qvp.get('open', [])
+              h_a = qvp.get('high', [])
+              l_a = qvp.get('low', [])
+              c_a = qvp.get('close', [])
+              v_a = qvp.get('volume', [])
+              # Window: last 12 hours = today's ACC+MAN (NY 1900 yesterday - 0700 today)
+              w_end_ts = utc_now.timestamp()
+              w_start_ts = (utc_now - timedelta(hours=12)).timestamp()
+              bars_vp = []
+              for i, ts in enumerate(tss):
+                  if w_start_ts <= ts < w_end_ts:
+                      if (i < len(h_a) and i < len(l_a) and i < len(v_a)
+                          and h_a[i] is not None and l_a[i] is not None
+                          and c_a[i] is not None and v_a[i]):
+                          bars_vp.append({
+                              'h': h_a[i], 'l': l_a[i],
+                              'c': c_a[i], 'o': o_a[i] if i < len(o_a) and o_a[i] is not None else c_a[i],
+                              'v': v_a[i]})
+              if len(bars_vp) >= 5:
+                  sess_h = max(b['h'] for b in bars_vp)
+                  sess_l = min(b['l'] for b in bars_vp)
+                  if sess_h > sess_l:
+                      rows = 10
+                      bkt  = (sess_h - sess_l) / rows
+                      tv   = [0.0] * rows
+                      for b in bars_vp:
+                          rng_b = max(b['h'] - b['l'], 0.01)
+                          for i in range(rows):
+                              bl = sess_l + i * bkt
+                              bh = sess_l + (i + 1) * bkt
+                              ov_l = max(b['l'], bl)
+                              ov_h = min(b['h'], bh)
+                              if ov_h > ov_l:
+                                  tv[i] += b['v'] * (ov_h - ov_l) / rng_b
+                      max_tv = max(tv)
+                      poc_i  = tv.index(max_tv)
+                      total  = sum(tv)
+                      target = total * 0.70
+                      va_v   = tv[poc_i]
+                      va_hi  = poc_i
+                      va_lo  = poc_i
+                      while va_v < target:
+                          up = va_hi + 1
+                          dn = va_lo - 1
+                          uv = tv[up] if up < rows else 0
+                          dv = tv[dn] if dn >= 0 else 0
+                          if uv == 0 and dv == 0:
+                              break
+                          if uv >= dv:
+                              va_hi = up
+                              va_v += uv
+                          else:
+                              va_lo = dn
+                              va_v += dv
+                      vp_poc = round(sess_l + (poc_i + 0.5) * bkt, 1)
+                      vp_vah = round(sess_l + (va_hi + 1)   * bkt, 1)
+                      vp_val = round(sess_l +  va_lo         * bkt, 1)
+                      # Position assessment vs current price
+                      if gold > vp_vah:
+                          vp_pos_cn, vp_hint, vp_color = '价值区上方', '强势，VAH 转支撑', '#51cf66'
+                      elif gold < vp_val:
+                          vp_pos_cn, vp_hint, vp_color = '价值区下方', '弱势，VAL 为阻力', '#ff6b6b'
+                      elif abs(gold - vp_poc) < bkt * 0.5:
+                          vp_pos_cn, vp_hint, vp_color = 'POC 附近', '价值中枢，方向待选', '#FFD700'
+                      elif gold > vp_poc:
+                          vp_pos_cn, vp_hint, vp_color = '价值区上半区', '偏多区，POC 是支撑', '#a3d977'
+                      else:
+                          vp_pos_cn, vp_hint, vp_color = '价值区下半区', '偏空区，POC 是阻力', '#ffa94d'
+                      vp_html = (
+                          '<div class="vpsec">'
+                          '<div class="vp-title">今日 ACC+MAN Volume Profile（' + str(len(bars_vp)) + '根30m）</div>'
+                          '<div class="vp-grid">'
+                          '<div class="vp-cell"><div class="vp-l">VAH</div><div class="vp-v vp-vah">' + str(vp_vah) + '</div></div>'
+                          '<div class="vp-cell"><div class="vp-l">POC</div><div class="vp-v vp-poc">' + str(vp_poc) + '</div></div>'
+                          '<div class="vp-cell"><div class="vp-l">VAL</div><div class="vp-v vp-val">' + str(vp_val) + '</div></div>'
+                          '</div>'
+                          '<div class="vp-pos" style="color:' + vp_color + '">' + vp_pos_cn + ' &middot; ' + vp_hint + '</div>'
+                          '</div>')
+                      print('VP OK - POC:', vp_poc, 'VAH:', vp_vah, 'VAL:', vp_val, 'pos:', vp_pos_cn)
+                  else:
+                      print('VP skip: no range')
+              else:
+                  print('VP skip: only', len(bars_vp), 'bars')
+          except Exception as e:
+              print('VP failed:', e)
+
           # 5. DeepSeek (bias-locked: strategy must match daily bias)
           if bias_cn == '震荡':
               bias_en = 'RANGING'
@@ -314,17 +422,22 @@ jobs:
                                     'Do NOT suggest a one-way directional bet.')
                   else:
                       bias_instr = 'Strategy should say wait for clearer direction.'
+                  vp_str = ''
+                  if vp_poc is not None:
+                      vp_str = (' VolProfile:POC=' + str(vp_poc) + ' VAH=' + str(vp_vah) +
+                                ' VAL=' + str(vp_val) + ' Pos=' + vp_pos_cn)
                   prompt = ('Gold: XAU/USD=' + str(gold) +
                       ' DXY=' + str(dxy) + '(' + dxy_dir + ')' +
                       ' US10Y=' + str(tnx) + '%(' + tnx_dir + ')' +
                       ' RSI14=' + str(rsi) + '(' + rsi_state + ')' +
                       ' ATR14=' + str(atr) +
                       ' R2=' + str(r2) + ' R1=' + str(r1) + ' S1=' + str(s1) + ' S2=' + str(s2) +
+                      vp_str +
                       ' DailyBias=' + bias_en +
                       '\nIMPORTANT: ' + bias_instr +
-                      ' Use the real indicators (RSI/ATR/US10Y) in the analysis. Write Chinese gold analysis. Respond ONLY valid JSON no markdown:\n' +
+                      ' Use the real indicators (RSI/ATR/US10Y/VP) in the analysis. Write Chinese gold analysis. Respond ONLY valid JSON no markdown:\n' +
                       '{"fundamental":["pt1","pt2","pt3","pt4"],"technical":["pt1","pt2"],"strategy":"one line"}\n' +
-                      'Each point <28 Chinese chars. Strategy <35 chars. At least one technical point should mention RSI or ATR.')
+                      'Each point <28 Chinese chars. Strategy <35 chars. Technical points should mention RSI/ATR/POC where relevant.')
                   ds_data = json.dumps({'model': 'deepseek-chat',
                       'messages': [{'role': 'user', 'content': prompt}],
                       'max_tokens': 400}).encode()
@@ -417,6 +530,16 @@ jobs:
               '.ll{font-size:12px;color:#888;margin-bottom:4px}'
               '.lr{font-size:18px;font-weight:700;color:#ff6b6b}'
               '.ls{font-size:18px;font-weight:700;color:#51cf66}'
+              '.vpsec{background:#1a1a1a;border-radius:12px;padding:16px;margin-bottom:12px}'
+              '.vp-title{color:#888;font-size:12px;margin-bottom:10px;letter-spacing:0.5px;text-align:center}'
+              '.vp-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px}'
+              '.vp-cell{background:#0f0f0f;border-radius:8px;padding:10px;text-align:center}'
+              '.vp-l{font-size:11px;color:#666;margin-bottom:3px;letter-spacing:0.5px}'
+              '.vp-v{font-size:16px;font-weight:700}'
+              '.vp-vah{color:#00bcd4}'
+              '.vp-poc{color:#FFD700}'
+              '.vp-val{color:#ff5722}'
+              '.vp-pos{font-size:12px;font-weight:500;text-align:center;padding-top:8px;border-top:1px solid #2a2a2a}'
               '.strat{background:#1a1a1a;border:1px solid #FFD700;border-radius:12px;padding:16px;margin-bottom:12px;text-align:center;color:#FFD700;font-size:15px;font-weight:500}'
               '.footer{text-align:center;color:#444;font-size:12px;padding:8px}'
           )
@@ -424,7 +547,7 @@ jobs:
           html = ('<!DOCTYPE html><html lang="zh"><head>'
               '<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">'
               '<title>XAU/USD</title><style>' + style + '</style></head><body><div class="card">'
-              '<div class="header"><h1>XAU/USD</h1><div class="dt">' + date_str + '</div></div>'
+              '<div class="header"><h1>XAU/USD</h1><div class="dt">' + date_str + title_tag + '</div></div>'
               '<div class="pbox"><div class="price">$' + '{:,.2f}'.format(gold) + '</div></div>'
               '<div class="metrics">'
               '<div class="m"><div class="m-l">DXY</div><div class="m-v">' + str(dxy) + '</div>'
@@ -448,6 +571,7 @@ jobs:
               '<div class="lv"><div class="ll">S1 支撑</div><div class="ls">' + str(s1) + '</div></div>'
               '<div class="lv"><div class="ll">S2 支撑</div><div class="ls">' + str(s2) + '</div></div>'
               '</div></div>'
+              + vp_html +
               '<div class="strat">' + strat + '</div>'
               '<div class="footer">数据来源：Yahoo Finance &bull; ForexFactory &bull; DeepSeek &bull; 仅供参考</div>'
               '</div></body></html>')
@@ -459,7 +583,7 @@ jobs:
 
           # 8. Write files (after pull, no unstaged changes issue)
           os.makedirs('XAUUSD', exist_ok=True)
-          fname = 'XAUUSD/' + date_str + '.html'
+          fname = 'XAUUSD/' + date_str + run_suffix + '.html'
           with open(fname, 'w', encoding='utf-8') as f:
               f.write(html)
           with open('XAUUSD/latest.html', 'w', encoding='utf-8') as f:
@@ -467,14 +591,15 @@ jobs:
           subprocess.run(['git', 'add', fname, 'XAUUSD/latest.html'],           check=True)
           diff = subprocess.run(['git', 'diff', '--cached', '--quiet'])
           if diff.returncode != 0:
-              subprocess.run(['git', 'commit', '-m', 'XAUUSD ' + date_str], check=True)
+              subprocess.run(['git', 'commit', '-m', 'XAUUSD ' + date_str + run_suffix], check=True)
               subprocess.run(['git', 'push'], check=True)
 
           # 9. Telegram
           tg = os.environ.get('TELEGRAM_TOKEN', '')
           if tg:
               page_url = 'https://ctsy0225.github.io/qqqm-monitor/XAUUSD/latest.html'
-              msg  = 'XAU/USD ' + date_str + '\n' + page_url
+              prefix = 'XAU/USD ' + ('19:00 复评 ' if is_pm else '') + date_str
+              msg  = prefix + '\n' + page_url
               data = json.dumps({'chat_id': '6454973171', 'text': msg}).encode()
               tg_req = urllib.request.Request(
                   'https://api.telegram.org/bot' + tg + '/sendMessage',
