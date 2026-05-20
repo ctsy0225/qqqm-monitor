@@ -30,12 +30,13 @@ jobs:
           today    = now_bj.date()
           date_str = str(today.day) + '-' + str(today.month) + '-' + str(today.year)
 
-          # Detect recheck mode: UTC hour 10-12 (= Beijing 18-20) means evening recheck
+          # Detect recheck mode: UTC 10-16 (Beijing 18-24) = evening recheck
+          # Wider window accounts for GitHub Actions cron delays (cron 11:00 can fire up to 14:00+)
           utc_now    = datetime.now(timezone.utc)
-          is_pm      = 10 <= utc_now.hour <= 12
+          is_pm      = 10 <= utc_now.hour <= 16
           run_suffix = '-pm' if is_pm else ''
           title_tag  = ' &middot; 19:00 复评' if is_pm else ''
-          print('Run mode:', 'PM RECHECK' if is_pm else 'AM MORNING')
+          print('Run mode:', 'PM RECHECK' if is_pm else 'AM MORNING', 'UTC hour:', utc_now.hour)
 
           # 1. Gold OHLC (30 days for ATR/RSI)
           req = urllib.request.Request(
